@@ -118,7 +118,7 @@ val finalDataset = combinedDf
     // Health
     col("Retransmission_Count"), col("Retransmission_Ratio"), col("Avg_Win_Size"), col("Win_Size_StdDev"), col("Min_Win_Size"), col("Max_Win_Size"), col("Win_Utilization"), col("Zero_Win_Count"),
     // Protocol & Efficiency
-    col("UDP_Ratio"), col("Header_Overhead_Ratio"), col("IP_Source_Entropy"), col("Primary_IP_Ratio"), col("Seq_Number_Rate"
+    col("UDP_Ratio"), col("Header_Overhead_Ratio"), col("IP_Source_Entropy"), col("Primary_IP_Ratio"), col("Seq_Number_Rate")
   )
 
 // 8. Output Results
