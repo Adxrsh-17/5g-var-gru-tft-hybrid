@@ -1,3 +1,7 @@
+# =====================================================
+# STABILIZED VAR-GRU-TFT MODEL (Fixed & Production Ready)
+# =====================================================
+
 import os
 import glob
 import warnings
@@ -6,7 +10,7 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks, optimizers, losses
 from statsmodels.tsa.api import VAR
-from sklearn.preprocessing import RobustScaler, MinMaxScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 # Suppress warnings
@@ -28,15 +32,15 @@ except:
     print("⚠️ ACCELERATION: Single Device Mode")
 
 # =====================================================
-# ⚙️ CONFIGURATION (TUNED)
+# ⚙️ CONFIGURATION
 # =====================================================
 CONFIG = {
-    "window": 60,            # Reduced window (120 is too long for unstable bursts)
+    "window": 60,            # Window size
     "forecast_horizon": 1,
-    "epochs": 150,           # Increased epochs
-    "batch_size": 256,       # Larger batch for stable gradients
-    "lr": 0.0001,            # Slower learning rate to prevent divergence
-    "var_lags": 3,           # Reduced lags to avoid overfitting linear noise
+    "epochs": 150,           
+    "batch_size": 256,       # Optimized for GPU
+    "lr": 0.0001,            # Stable LR
+    "var_lags": 3,           
     "target_slice": "Naver"  # eMBB
 }
 
@@ -75,7 +79,7 @@ def load_and_prep_data(data_path, slice_name):
         
     raw_data = pd.concat(dfs, ignore_index=True)
     
-    # Slice Filter
+    # Filter Slice
     target_label = SLICE_MAP.get(slice_name, slice_name)
     print(f"✂️ Filtering for Slice Label: '{target_label}'")
     
@@ -95,7 +99,7 @@ def load_and_prep_data(data_path, slice_name):
         
     print(f"✅ Loaded {len(df_slice)} samples.")
 
-    # Map Features (NO LOG TRANSFORM - Using RobustScaler only)
+    # Map Features
     final_df = pd.DataFrame()
     for target, source in FEATURE_MAP.items():
         if source in df_slice.columns:
@@ -106,7 +110,7 @@ def load_and_prep_data(data_path, slice_name):
     return final_df.ffill().bfill().fillna(0)
 
 # =====================================================
-# 🏗️ MODEL ARCHITECTURE (Huber Loss + GRU-TFT)
+# 🏗️ MODEL ARCHITECTURE (FIXED)
 # =====================================================
 class GatedResidualNetwork(layers.Layer):
     def __init__(self, units, dropout):
@@ -114,23 +118,37 @@ class GatedResidualNetwork(layers.Layer):
         self.units = units
         self.elu_dense = layers.Dense(units, activation='elu')
         self.linear_dense = layers.Dense(units)
-        self.dropout = layers.Dropout(dropout)
+        self.dropout_layer = layers.Dropout(dropout)
         self.gate = layers.Dense(units, activation='sigmoid')
         self.norm = layers.LayerNormalization()
+        self.skip_project = None # Placeholder
+
+    def build(self, input_shape):
+        # FIX: Create the skip layer HERE, not in call()
+        if input_shape[-1] != self.units:
+            self.skip_project = layers.Dense(self.units)
+        super().build(input_shape)
 
     def call(self, x):
-        skip = x if x.shape[-1] == self.units else layers.Dense(self.units)(x)
-        x = self.elu_dense(x)
-        x = self.dropout(x)
-        x = self.linear_dense(x)
-        x = x * self.gate(x)
-        return self.norm(skip + x)
+        # Apply skip connection (either direct or projected)
+        if self.skip_project is not None:
+            skip = self.skip_project(x)
+        else:
+            skip = x
+            
+        # Network Body
+        x_val = self.elu_dense(x)
+        x_val = self.dropout_layer(x_val)
+        x_val = self.linear_dense(x_val)
+        x_val = x_val * self.gate(x) # GLU-style gating
+        
+        return self.norm(skip + x_val)
 
 def build_model(input_shape):
     inputs = layers.Input(shape=input_shape)
     
     # Feature Extraction
-    x = GatedResidualNetwork(64, 0.1)(inputs) # Reduced units to prevent overfitting
+    x = GatedResidualNetwork(64, 0.1)(inputs)
     
     # Sequential Modeling
     x = layers.GRU(128, return_sequences=True, dropout=0.2)(x)
@@ -148,7 +166,7 @@ def build_model(input_shape):
     
     model = models.Model(inputs, outputs, name="Stabilized_Hybrid_Model")
     
-    # HUBER LOSS: Key fix for bursty traffic (ignores massive outliers)
+    # Use Huber loss for robustness against 5G bursts
     model.compile(optimizer=optimizers.Adam(CONFIG['lr']), 
                   loss=losses.Huber(delta=1.0), 
                   metrics=['mae'])
@@ -171,7 +189,7 @@ def run_pipeline():
     val_df = df.iloc[int(0.7*n):int(0.85*n)]
     test_df = df.iloc[int(0.85*n):]
     
-    # 4. Scaling (RobustScaler handles the bursts)
+    # 4. Scaling
     scaler = RobustScaler()
     train_scaled = scaler.fit_transform(train_df)
     val_scaled = scaler.transform(val_df)
@@ -197,7 +215,7 @@ def run_pipeline():
         print("✅ VAR fitted successfully.")
         
     except:
-        print("⚠️ VAR Failed/Skipped. Using Raw Data mode.")
+        print("⚠️ VAR Failed. Using Raw Data mode.")
         res_train, res_val, res_test = train_scaled, val_scaled, test_scaled
         var_pred_test = np.zeros_like(test_scaled)
 
@@ -237,11 +255,9 @@ def run_pipeline():
     L = len(resid_pred)
     final_pred = var_pred_test[CONFIG['window']:CONFIG['window']+L] + resid_pred
     
-    # Inverse Scale
+    # Inverse Scale & Clip
     y_pred_real = scaler.inverse_transform(final_pred)
     y_true_real = scaler.inverse_transform(test_scaled[CONFIG['window']:CONFIG['window']+L])
-    
-    # Force Positive (Physics constraint)
     y_pred_real = np.maximum(y_pred_real, 0)
 
     # Metrics
