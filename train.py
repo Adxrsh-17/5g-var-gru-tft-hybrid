@@ -30,7 +30,7 @@ else:
     print("⚠️ No GPU detected. Training might be slow.")
 
 # =====================================================
-# CONFIG
+# CONFIGURATION
 # =====================================================
 CONFIG = {
     "window": 120,          # Lookback window (e.g., 120 seconds)
@@ -38,14 +38,21 @@ CONFIG = {
     "batch_size": 64,
     "lr": 0.0005,           # Lower LR for stability
     "var_lags": 5,
-    "slice_filter": "Naver" # CHANGE THIS to: 'mMTC', 'Naver', or 'Youtube'
+    # SELECT YOUR SLICE HERE: 'Naver', 'Youtube', or 'MMTC'
+    "target_slice": "Naver" 
+}
+
+# Map user-friendly names to the actual dataset labels from your Scala script
+SLICE_LABEL_MAP = {
+    "Naver": "eMBB",
+    "Youtube": "URLLC",
+    "MMTC": "mMTC"
 }
 
 # =====================================================
 # FEATURE SELECTION (The "Worthy" 7)
 # =====================================================
 # We map the raw 36 columns to 7 independent dimensions
-# to capture the full state of the network slice.
 FEATURE_MAP = {
     "throughput":   "Throughput_bps",       # [Target] Volume
     "packets":      "Total_Packets",        # [Target] Activity
@@ -59,24 +66,25 @@ FEATURE_MAP = {
 TARGET_FEATURES = list(FEATURE_MAP.keys())
 
 # =====================================================
-# LOAD AND MAP DATA (CSV Support + Slice Filtering)
+# DATA LOADING & ENGINEERING
 # =====================================================
-def load_and_map_data(data_path, slice_name=None):
+def load_and_map_data(data_path, target_slice_name):
     """
-    Load dataset (CSV/Parquet), filter by Slice, and map independent features.
+    Load dataset (CSV/Parquet), filter by correct Slice Label, and map features.
     """
     print(f"🔍 Searching for files in: {data_path}")
     
-    # Support both CSV (Scala output) and Parquet (Consumer output)
-    files = glob.glob(os.path.join(data_path, "**", "*.csv"), recursive=True)
+    # 1. Recursive Search for Parquet or CSV
+    files = glob.glob(os.path.join(data_path, "**", "*.parquet"), recursive=True)
     if not files:
-        files = glob.glob(os.path.join(data_path, "**", "*.parquet"), recursive=True)
+        files = glob.glob(os.path.join(data_path, "**", "*.csv"), recursive=True)
         
     if not files:
-        raise FileNotFoundError(f"No CSV or Parquet files found in {data_path}.")
+        raise FileNotFoundError(f"❌ No files found in {data_path}. Check your dataset connection.")
     
     print(f"📂 Found {len(files)} file(s). Loading...")
     
+    # 2. Load all parts
     dfs = []
     for f in files:
         try:
@@ -86,50 +94,70 @@ def load_and_map_data(data_path, slice_name=None):
                 df = pd.read_csv(f)
             dfs.append(df)
         except Exception as e:
-            print(f"⚠️ Could not read {f}: {e}")
+            print(f"⚠️ Skipping {os.path.basename(f)}: {e}")
             
-    if not dfs: raise ValueError("No data loaded.")
+    if not dfs: raise ValueError("No valid data loaded.")
 
     raw_data = pd.concat(dfs, ignore_index=True)
     
-    # --- CRITICAL: FILTER BY SLICE TYPE ---
-    # Time series models fail if you mix different slices (e.g., IoT and Video) 
-    # into one continuous line.
-    if 'Slice_Type' in raw_data.columns and slice_name:
-        print(f"✂️ Filtering for Slice_Type: {slice_name}")
-        raw_data = raw_data[raw_data['Slice_Type'].astype(str).str.contains(slice_name, case=False, na=False)]
+    # 3. Filter by Slice Type (Fixing the Naver vs eMBB issue)
+    # Get the actual dataset label (e.g., 'eMBB') from our map
+    dataset_label = SLICE_LABEL_MAP.get(target_slice_name, target_slice_name)
     
-    # Ensure time sorting (Serial_No from Scala script)
-    if 'Serial_No' in raw_data.columns:
-        raw_data = raw_data.sort_values('Serial_No')
+    print(f"✂️ Filtering for Slice Label: '{dataset_label}' (User selected: '{target_slice_name}')")
+    
+    # Check if column exists
+    if 'Slice_Type' not in raw_data.columns:
+        # Fallback for old CSVs
+        if 'slice_label' in raw_data.columns:
+            raw_data.rename(columns={'slice_label': 'Slice_Type'}, inplace=True)
+        else:
+            print(f"⚠️ 'Slice_Type' column missing. Available: {raw_data.columns}")
+            print("   Assuming single-slice dataset.")
+            raw_data['Slice_Type'] = dataset_label
+
+    # Apply Filter
+    filtered_data = raw_data[raw_data['Slice_Type'].astype(str) == dataset_label].copy()
+    
+    if len(filtered_data) == 0:
+        print(f"❌ ERROR: No data found for label '{dataset_label}'.")
+        print(f"   Available labels in dataset: {raw_data['Slice_Type'].unique()}")
+        raise ValueError("Data filter returned empty result.")
+
+    # 4. Sort by Time
+    if 'Serial_No' in filtered_data.columns:
+        filtered_data = filtered_data.sort_values('Serial_No')
+    else:
+        # Fallback if Serial_No is missing but we have 40kpi output
+        print("⚠️ 'Serial_No' missing, assuming data is already time-ordered.")
         
-    print(f"✅ Loaded {len(raw_data)} samples for training.")
+    print(f"✅ Loaded {len(filtered_data)} samples for training.")
     
-    # Map to the 7 Independent Features
+    # 5. Map Features & Log Transform
     mapped_data = pd.DataFrame()
     for target, source in FEATURE_MAP.items():
-        if source not in raw_data.columns:
-            print(f"⚠️ Warning: {source} not found. Filling zeros.")
+        if source not in filtered_data.columns:
+            print(f"⚠️ Warning: Column '{source}' not found. Filling with zeros.")
             mapped_data[target] = 0
         else:
-            col_data = raw_data[source].copy()
-            # Log transform huge volume metrics to stabilize Neural Net
+            col_data = filtered_data[source].copy()
+            # Log transform heavy-tailed metrics to stabilize gradients
             if target in ['throughput', 'packets']:
                 mapped_data[target] = np.log1p(col_data)
             else:
                 mapped_data[target] = col_data
 
-    # Clean data (New Pandas syntax)
+    # 6. Final Cleanup
     mapped_data = mapped_data.ffill().bfill().fillna(0)
     
-    print(f"\n📊 Final Independent Features: {list(mapped_data.columns)}")
+    print(f"📊 Final Feature Matrix: {mapped_data.shape}")
     return mapped_data
 
 # =====================================================
-# TFT-STYLE COMPONENTS
+# MODEL ARCHITECTURE (TFT Components)
 # =====================================================
 class GatedResidualNetwork(layers.Layer):
-    """Gated Residual Network from Temporal Fusion Transformer"""
+    """GRN: The core building block of TFT"""
     def __init__(self, units, dropout=0.1):
         super().__init__()
         self.units = units
@@ -157,7 +185,7 @@ class GatedResidualNetwork(layers.Layer):
         return self.norm(x + residual)
 
 class TemporalAttention(layers.Layer):
-    """Multi-head attention for temporal patterns"""
+    """Interpretable Multi-Head Attention"""
     def __init__(self, d_model, num_heads=4, dropout=0.1):
         super().__init__()
         self.mha = layers.MultiHeadAttention(num_heads, d_model // num_heads)
@@ -169,35 +197,33 @@ class TemporalAttention(layers.Layer):
         attn_out = self.dropout(attn_out, training=training)
         return self.norm(x + attn_out)
 
-# =====================================================
-# VAR-GRU-TFT HYBRID MODEL
-# =====================================================
 def build_var_gru_tft_model(input_shape):
+    """Constructs the Hybrid Model"""
     inputs = layers.Input(shape=input_shape)
     
-    # Feature transformation
+    # 1. Feature Projection (GRN)
     x = GatedResidualNetwork(128, dropout=0.15)(inputs)
     
-    # Temporal encoding (GRU)
+    # 2. Sequential Encoder (GRU Stack)
     x = layers.GRU(256, return_sequences=True, dropout=0.2)(x)
     x = layers.GRU(128, return_sequences=True, dropout=0.2)(x)
     
-    # Temporal Attention
+    # 3. Temporal Self-Attention (TFT)
     x = TemporalAttention(128, num_heads=4, dropout=0.1)(x)
     
-    # Global Context
+    # 4. Global Context Decoding
     x = layers.GRU(64, dropout=0.2)(x)
     x = GatedResidualNetwork(64, dropout=0.1)(x)
     
-    # Output
+    # 5. Output Projection
     outputs = layers.Dense(input_shape[-1])(x)
     
-    model = models.Model(inputs, outputs)
+    model = models.Model(inputs, outputs, name="VAR_GRU_TFT")
     model.compile(optimizer=optimizers.Adam(CONFIG["lr"]), loss='mse', metrics=['mae'])
     return model
 
 # =====================================================
-# SEQUENCE CREATION
+# PIPELINE HELPERS
 # =====================================================
 def create_sequences(data, window):
     X, Y = [], []
@@ -206,18 +232,16 @@ def create_sequences(data, window):
         Y.append(data[i + window])
     return np.array(X), np.array(Y)
 
-# =====================================================
-# TRAINING PIPELINE
-# =====================================================
 def train_forecasting_model(data_path):
-    # 1. Load Data
-    print("\n" + "="*60 + "\nSTEP 1: Loading Independent Data\n" + "="*60)
-    df = load_and_map_data(data_path, slice_name=CONFIG['slice_filter'])
+    # --- Step 1: Data Loading ---
+    print("\n" + "="*60 + "\nSTEP 1: Loading & Mapping Data\n" + "="*60)
+    df = load_and_map_data(data_path, CONFIG['target_slice'])
     
-    if len(df) < CONFIG['window'] * 2:
-        raise ValueError(f"Not enough data for slice {CONFIG['slice_filter']}. Try a different slice.")
+    # Validation check
+    if len(df) < CONFIG['window'] * 5:
+        raise ValueError(f"Dataset too small ({len(df)} rows). Need at least {CONFIG['window']*5}.")
 
-    # 2. Split
+    # --- Step 2: Splitting ---
     n = len(df)
     train_idx = int(0.70 * n)
     val_idx = int(0.85 * n)
@@ -226,44 +250,46 @@ def train_forecasting_model(data_path):
     val_data = df.iloc[train_idx:val_idx].values
     test_data = df.iloc[val_idx:].values
     
-    # 3. Scale
+    # --- Step 3: Robust Scaling ---
+    print("\nSTEP 2: Scaling Data")
     scaler = RobustScaler()
     train_scaled = scaler.fit_transform(train_data)
     val_scaled = scaler.transform(val_data)
     test_scaled = scaler.transform(test_data)
     
-    # 4. VAR Model
-    print("\n" + "="*60 + "\nSTEP 3: Fitting VAR (Linear Baseline)\n" + "="*60)
+    # --- Step 4: VAR (Linear Baseline) ---
+    print("\nSTEP 3: Fitting VAR Model")
     train_df_var = pd.DataFrame(train_scaled, columns=TARGET_FEATURES)
     try:
         var_model = VAR(train_df_var).fit(maxlags=CONFIG["var_lags"])
         k = var_model.k_ar
         print(f"✅ VAR fitted. Lag order: {k}")
     except Exception as e:
-        print(f"⚠️ VAR failed: {e}. Using zero-residuals.")
+        print(f"⚠️ VAR failed: {e}. Using zero-residuals (Pure GRU-TFT mode).")
         var_model = None
         k = 0
 
-    # 5. Residuals
+    # Calculate Residuals (Remove linear component)
     if var_model:
-        # Forecast only works if we have k history points
-        var_val = var_model.forecast(train_scaled[-k:], len(val_scaled))
-        var_test = var_model.forecast(np.vstack([train_scaled[-k:], val_scaled]), len(test_scaled))
+        var_val_pred = var_model.forecast(train_scaled[-k:], len(val_scaled))
+        var_test_pred = var_model.forecast(np.vstack([train_scaled[-k:], val_scaled]), len(test_scaled))
         
         residual_train = train_scaled[k:] - var_model.fittedvalues.values
-        residual_val = val_scaled - var_val
-        residual_test = test_scaled - var_test
+        residual_val = val_scaled - var_val_pred
+        residual_test = test_scaled - var_test_pred
     else:
         residual_train, residual_val, residual_test = train_scaled, val_scaled, test_scaled
-        var_test = np.zeros_like(test_scaled)
+        var_test_pred = np.zeros_like(test_scaled)
 
-    # 6. Sequences
+    # --- Step 5: Sequence Generation ---
     X_train, Y_train = create_sequences(residual_train, CONFIG["window"])
     X_val, Y_val = create_sequences(residual_val, CONFIG["window"])
     X_test, Y_test = create_sequences(residual_test, CONFIG["window"])
     
-    # 7. Model
-    print("\n" + "="*60 + "\nSTEP 5: Training VAR-GRU-TFT\n" + "="*60)
+    print(f"📦 Sequences created. Train: {X_train.shape}, Test: {X_test.shape}")
+
+    # --- Step 6: Model Training ---
+    print("\nSTEP 4: Training Hybrid Model")
     model = build_var_gru_tft_model(input_shape=(X_train.shape[1], X_train.shape[2]))
     
     history = model.fit(
@@ -272,59 +298,85 @@ def train_forecasting_model(data_path):
         epochs=CONFIG["epochs"],
         batch_size=CONFIG["batch_size"],
         callbacks=[
-            callbacks.EarlyStopping(patience=10, restore_best_weights=True),
-            callbacks.ReduceLROnPlateau(patience=5, factor=0.5)
+            callbacks.EarlyStopping(patience=10, restore_best_weights=True, verbose=1),
+            callbacks.ReduceLROnPlateau(patience=5, factor=0.5, verbose=1)
         ],
         verbose=1
     )
     
-    # 8. Evaluation & Reconstruction
-    print("\n" + "="*60 + "\nSTEP 7: Evaluation (Inverse Log Transform)\n" + "="*60)
-    residual_pred = model.predict(X_test)
+    # --- Step 7: Evaluation & Inversion ---
+    print("\n" + "="*60 + "\nSTEP 5: Evaluation\n" + "="*60)
     
-    # Match lengths
-    L = min(len(residual_pred), len(var_test) - CONFIG["window"])
-    var_comp = var_test[CONFIG["window"]:CONFIG["window"] + L]
-    pred_comp = residual_pred[:L]
+    # Predict Residuals
+    resid_pred = model.predict(X_test, verbose=0)
     
-    final_pred_scaled = var_comp + pred_comp
+    # Add back Linear Component (VAR)
+    # Align lengths (Sequence generation trims the start)
+    L = len(resid_pred)
+    # The VAR forecast aligned with the test residuals
+    var_comp = var_test_pred[CONFIG["window"]:CONFIG["window"]+L]
     
-    # Inverse Scaling
+    # Final Scaled Prediction
+    final_pred_scaled = var_comp + resid_pred
+    
+    # Inverse Scale
     y_pred = scaler.inverse_transform(final_pred_scaled)
-    y_true = scaler.inverse_transform(test_scaled[CONFIG["window"]:CONFIG["window"] + L])
+    y_true = scaler.inverse_transform(test_scaled[CONFIG["window"]:CONFIG["window"]+L])
     
-    # Inverse Log Transform (Expm1) for Volume Metrics
-    # Indices: 0=throughput, 1=packets
-    y_pred[:, 0] = np.expm1(y_pred[:, 0]) # Throughput
-    y_true[:, 0] = np.expm1(y_true[:, 0])
-    y_pred[:, 1] = np.expm1(y_pred[:, 1]) # Packets
-    y_true[:, 1] = np.expm1(y_true[:, 1])
+    # Inverse Log Transform (np.expm1) ONLY for Volume metrics
+    # Indices 0 (throughput) and 1 (packets) are log-transformed
+    for i in [0, 1]:
+        y_pred[:, i] = np.expm1(y_pred[:, i])
+        y_true[:, i] = np.expm1(y_true[:, i])
+        # Clip negative predictions for physical realism
+        y_pred[:, i] = np.maximum(y_pred[:, i], 0)
+
+    # Calculate Metrics
+    print(f"{'FEATURE':<15} | {'RMSE':<10} | {'MAE':<10} | {'MAPE':<10}")
+    print("-" * 55)
     
-    # Metrics
     for i, feature in enumerate(TARGET_FEATURES):
         rmse = np.sqrt(mean_squared_error(y_true[:, i], y_pred[:, i]))
         mae = mean_absolute_error(y_true[:, i], y_pred[:, i])
-        print(f"{feature:15s} | RMSE: {rmse:10.2f} | MAE: {mae:10.2f}")
+        
+        # Safe MAPE
+        non_zero = y_true[:, i] > 1e-6
+        if np.sum(non_zero) > 0:
+            mape = mean_absolute_percentage_error(y_true[non_zero, i], y_pred[non_zero, i]) * 100
+        else:
+            mape = 0.0
+            
+        print(f"{feature:<15} | {rmse:<10.2f} | {mae:<10.2f} | {mape:<9.2f}%")
         
     return model
 
 # =====================================================
-# MAIN
+# MAIN ENTRY POINT
 # =====================================================
 if __name__ == "__main__":
-    # Path to the folder containing final40kpi.csv
-    possible_paths = [
-        "/kaggle/input/final40kpi", 
-        "/kaggle/input/5g-36kpi",
-        "/opt/spark/work-dir", # Spark output path
-        "."
-    ]
-    DATA_PATH = next((p for p in possible_paths if os.path.exists(p)), ".")
-    print(f"📍 Data Path: {DATA_PATH}")
+    # 1. Find Data Path
+    # Helper to find where Kaggle mounted the dataset
+    search_roots = ["/kaggle/input", "."]
+    DATA_PATH = None
+    
+    # Look for the '5g-36kpi' folder or similar
+    for root in search_roots:
+        candidates = glob.glob(os.path.join(root, "*5g*"))
+        if candidates:
+            DATA_PATH = candidates[0]
+            break
+            
+    if not DATA_PATH:
+        # Fallback if specific folder name varies
+        DATA_PATH = "/kaggle/input" 
+        
+    print(f"📍 Detected Data Path: {DATA_PATH}")
 
+    # 2. Run
     try:
         model = train_forecasting_model(DATA_PATH)
-        print("\n✅ Process Complete.")
+        print("\n✅ Training Complete. Saving Model...")
         model.save("var_gru_tft_final.h5")
+        print("💾 Model saved.")
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ CRITICAL ERROR: {e}")
