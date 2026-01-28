@@ -1,163 +1,80 @@
 // PcapKpiExtractor.scala
-// Phase 2: Production-Ready Distributed PCAP Processing
-// HDFS → Spark (Distributed Binary Decode) → KPI DataFrame → Kafka Ready
+// Phase 2: Distributed PCAP Processing with Packet-Level Kafka Streaming
+// Architecture: HDFS → Spark (Executor-Side Decoding) → Kafka (Packet Events) → Ready for Streaming KPI
 
-import org.apache.spark.sql.{SparkSession, DataFrame, Row}
+import org.apache.spark.sql.{SparkSession, DataFrame}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types._
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.input.PortableDataStream
 import java.io.{DataInputStream, BufferedInputStream}
 import java.nio.{ByteBuffer, ByteOrder}
-import scala.collection.mutable.ArrayBuffer
 
-// Configuration object for thresholds (can be overridden via environment variables)
-object KpiConfig {
+// ============================================
+// CONFIGURATION MODULE
+// ============================================
+object KpiConfig extends Serializable {
   val IDLE_THRESHOLD: Double = sys.env.getOrElse("KPI_IDLE_THRESHOLD", "0.1").toDouble
   val SMALL_PKT_THRESHOLD: Int = sys.env.getOrElse("KPI_SMALL_PKT", "100").toInt
   val LARGE_PKT_THRESHOLD: Int = sys.env.getOrElse("KPI_LARGE_PKT", "1400").toInt
-  val MAX_PACKETS_PER_FILE: Int = sys.env.getOrElse("KPI_MAX_PACKETS", "10000").toInt
-  val EPS: Double = 1e-6  // Epsilon for division safety
+  val MAX_PACKETS_PER_FILE: Int = sys.env.getOrElse("KPI_MAX_PACKETS", "100000").toInt
+  val EPS: Double = 1e-6  // Epsilon for numerical stability
+  
+  // Kafka Configuration
+  val KAFKA_BOOTSTRAP_SERVERS: String = sys.env.getOrElse("KAFKA_BOOTSTRAP", "kafka:9092")
+  val KAFKA_PACKET_TOPIC: String = sys.env.getOrElse("KAFKA_PACKET_TOPIC", "5g-packet-events")
+  val KAFKA_BATCH_SIZE: Int = sys.env.getOrElse("KAFKA_BATCH_SIZE", "1000").toInt
+  
+  // HDFS Paths
+  val HDFS_BASE: String = "hdfs://namenode:8020/5G_kpi"
+  val HDFS_RAW_PCAP: String = s"$HDFS_BASE/raw/pcap"
+  val HDFS_CHECKPOINT: String = s"$HDFS_BASE/checkpoints"
 }
 
-// Case class for decoded packets (with IP addresses for flow tracking)
-case class Packet(
-  sliceType: String,
+// ============================================
+// PACKET EVENT SCHEMA (Kafka Payload)
+// ============================================
+case class PacketEvent(
+  sliceType: String,        // eMBB / URLLC / mMTC
   fileName: String,
-  timestampSec: Long,
-  timestampUsec: Long,
+  timestamp: Double,        // Unix timestamp (seconds.microseconds)
+  timestampMs: Long,        // Milliseconds for event-time
   packetLen: Int,
   capturedLen: Int,
-  protocol: String,
+  protocol: String,         // TCP / UDP / ICMP / OTHER
   srcIp: String,
   dstIp: String,
   srcPort: Int,
   dstPort: Int,
+  flowId: String,           // Flow identifier: srcIp_dstIp_srcPort_dstPort_protocol
   ipHeaderLen: Int,
   tcpFlags: Int,
   windowSize: Int,
   seqNumber: Long
-)
+) extends Serializable
 
-object PcapKpiExtractor {
-
-  def main(args: Array[String]): Unit = {
-    val spark = SparkSession.builder()
-      .appName("5G_PCAP_KPI_Extractor")
-      .config("spark.hadoop.fs.defaultFS", "hdfs://namenode:8020")
-      .master("local[*]")
-      .getOrCreate()
-    
-    import spark.implicits._
-    spark.sparkContext.setLogLevel("WARN")
-    
-    println("\n" + "="*60)
-    println("   5G PCAP-TO-KPI PIPELINE - PHASE 2 (PRODUCTION)")
-    println("   Distributed Binary PCAP Decoding + KPI Computation")
-    println("="*60)
-    println(s"\n⚙️ Configuration:")
-    println(s"   IDLE_THRESHOLD:    ${KpiConfig.IDLE_THRESHOLD}s")
-    println(s"   SMALL_PKT:         ${KpiConfig.SMALL_PKT_THRESHOLD} bytes")
-    println(s"   LARGE_PKT:         ${KpiConfig.LARGE_PKT_THRESHOLD} bytes")
-    println(s"   MAX_PACKETS/FILE:  ${KpiConfig.MAX_PACKETS_PER_FILE}")
-    println(s"   EPS:               ${KpiConfig.EPS}")
-    
-    val hdfsBasePath = "hdfs://namenode:8020/5G_kpi/raw/pcap"
-    val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
-    
-    // Slice directories
-    val sliceDirs = Map(
-      "eMBB" -> s"$hdfsBasePath/emBB",
-      "URLLC" -> s"$hdfsBasePath/urllc",
-      "mMTC" -> s"$hdfsBasePath/mmtc"
-    )
-    
-    // Collect all packets from all files
-    var allPackets = ArrayBuffer[Packet]()
-    
-    println("\n📦 PHASE 2A: Decoding PCAP Files...\n")
-    
-    sliceDirs.foreach { case (sliceType, dirPath) =>
-      println(s"🔍 Processing $sliceType...")
-      
-      try {
-        val path = new Path(dirPath)
-        if (fs.exists(path)) {
-          val files = fs.listStatus(path).filter(_.getPath.getName.endsWith(".pcap"))
-          
-          // Process first file of each slice for PoC (limit for speed)
-          val filesToProcess = if (sliceType == "mMTC") files.take(2) else files.take(1)
-          
-          filesToProcess.foreach { fileStatus =>
-            val filePath = fileStatus.getPath
-            val fileName = filePath.getName
-            print(s"   📄 $fileName ... ")
-            
-            val packets = decodePcapFile(fs, filePath, sliceType, fileName, maxPackets = KpiConfig.MAX_PACKETS_PER_FILE)
-            allPackets ++= packets
-            println(s"✅ ${packets.length} packets")
-          }
-        }
-      } catch {
-        case e: Exception => println(s"   ❌ Error: ${e.getMessage}")
-      }
-    }
-    
-    println(s"\n📊 Total packets decoded: ${allPackets.length}")
-    
-    // Convert to DataFrame
-    println("\n📦 PHASE 2B: Converting to DataFrame...")
-    val packetDF = allPackets.toSeq.toDF()
-    
-    // Add computed columns with flow ID for proper IAT calculation
-    val enrichedDF = packetDF
-      .withColumn("timestamp", col("timestampSec") + col("timestampUsec") / 1000000.0)
-      .withColumn("timestampMs", (col("timestamp") * 1000).cast(LongType))
-      // Create flow ID for flow-partitioned IAT calculation
-      .withColumn("flowId", 
-        concat_ws("_", col("srcIp"), col("dstIp"), col("srcPort"), col("dstPort"), col("protocol"))
-      )
-    
-    println(s"   ✅ DataFrame created with ${enrichedDF.count()} rows")
-    enrichedDF.printSchema()
-    
-    // Show sample data
-    println("\n📋 Sample Packets:")
-    enrichedDF.select("sliceType", "timestamp", "packetLen", "protocol", "srcPort", "dstPort")
-      .show(10, truncate = false)
-    
-    // PHASE 2C: Compute KPIs per 1-second window
-    println("\n📦 PHASE 2C: Computing 36 KPIs per Window...")
-    
-    val kpiDF = computeKPIs(enrichedDF, spark)
-    
-    println(s"\n✅ KPI DataFrame created with ${kpiDF.count()} windows")
-    println("\n📋 Sample KPIs:")
-    kpiDF.show(5, truncate = false)
-    
-    // Save to HDFS as Parquet
-    val outputPath = "hdfs://namenode:8020/5G_kpi/processed/kpi_parquet"
-    println(s"\n💾 Saving KPIs to: $outputPath")
-    
-    kpiDF.write.mode("overwrite").partitionBy("sliceType").parquet(outputPath)
-    
-    println("\n" + "="*60)
-    println("✅ PHASE 2 COMPLETE!")
-    println("="*60)
-    println(s"   Packets Processed: ${allPackets.length}")
-    println(s"   KPI Windows:       ${kpiDF.count()}")
-    println(s"   Output:            $outputPath")
-    println("\nNext: Phase 3 - Kafka Streaming Integration")
-    
-    spark.stop()
-  }
+// ============================================
+// PCAP DECODER MODULE (Executor-Side)
+// ============================================
+object PcapDecoder extends Serializable {
   
-  // PCAP Binary Decoder
-  def decodePcapFile(fs: FileSystem, filePath: Path, sliceType: String, fileName: String, maxPackets: Int): ArrayBuffer[Packet] = {
-    val packets = ArrayBuffer[Packet]()
-    val inputStream = new DataInputStream(new BufferedInputStream(fs.open(filePath), 65536))
+  /**
+   * Decodes PCAP file from PortableDataStream (runs on executors)
+   * Returns iterator of PacketEvent objects
+   */
+  def decodePcapFromStream(
+    pds: PortableDataStream, 
+    sliceType: String, 
+    fileName: String, 
+    maxPackets: Int
+  ): Iterator[PacketEvent] = {
+    
+    val packets = scala.collection.mutable.ArrayBuffer[PacketEvent]()
+    var inputStream: DataInputStream = null
     
     try {
+      inputStream = new DataInputStream(new BufferedInputStream(pds.open(), 65536))
+      
       // Read Global Header (24 bytes)
       val magicNumber = inputStream.readInt()
       val isLittleEndian = (magicNumber == 0xd4c3b2a1 || magicNumber == 0x4d3cb2a1)
@@ -167,6 +84,7 @@ object PcapKpiExtractor {
       
       var packetCount = 0
       
+      // Read packets
       while (inputStream.available() > 16 && packetCount < maxPackets) {
         // Read Packet Header (16 bytes)
         val tsSec = readInt(inputStream, isLittleEndian)
@@ -189,16 +107,22 @@ object PcapKpiExtractor {
         }
       }
     } catch {
-      case _: java.io.EOFException => // End of file
-      case e: Exception => println(s"Decode error: ${e.getMessage}")
+      case _: java.io.EOFException => // End of file - normal
+      case e: Exception => 
+        // Log error but continue (distributed processing should be resilient)
+        System.err.println(s"Error decoding $fileName: ${e.getMessage}")
     } finally {
-      inputStream.close()
+      if (inputStream != null) inputStream.close()
+      // PortableDataStream closes automatically when its InputStream is closed
     }
     
-    packets
+    packets.iterator
   }
   
-  def readInt(dis: DataInputStream, littleEndian: Boolean): Int = {
+  /**
+   * Reads 4-byte integer with endianness handling
+   */
+  private def readInt(dis: DataInputStream, littleEndian: Boolean): Int = {
     val bytes = new Array[Byte](4)
     dis.readFully(bytes)
     if (littleEndian) {
@@ -208,8 +132,19 @@ object PcapKpiExtractor {
     }
   }
   
-  def parsePacket(data: Array[Byte], sliceType: String, fileName: String, 
-                  tsSec: Int, tsUsec: Int, origLen: Int, capLen: Int): Packet = {
+  /**
+   * Parses packet data to extract headers and create PacketEvent
+   */
+  private def parsePacket(
+    data: Array[Byte], 
+    sliceType: String, 
+    fileName: String,
+    tsSec: Int, 
+    tsUsec: Int, 
+    origLen: Int, 
+    capLen: Int
+  ): PacketEvent = {
+    
     var protocol = "OTHER"
     var srcIp = "0.0.0.0"
     var dstIp = "0.0.0.0"
@@ -261,85 +196,276 @@ object PcapKpiExtractor {
         }
       }
     } catch {
-      case _: Exception => // Keep defaults
+      case _: Exception => // Keep defaults on parse failure
     }
     
-    Packet(sliceType, fileName, tsSec.toLong & 0xFFFFFFFFL, tsUsec.toLong & 0xFFFFFFFFL, 
-           origLen, capLen, protocol, srcIp, dstIp, srcPort, dstPort, ipHeaderLen, tcpFlags, windowSize, seqNumber)
+    // Create timestamp values
+    val timestamp = (tsSec.toLong & 0xFFFFFFFFL) + ((tsUsec.toLong & 0xFFFFFFFFL) / 1000000.0)
+    val timestampMs = ((tsSec.toLong & 0xFFFFFFFFL) * 1000L) + ((tsUsec.toLong & 0xFFFFFFFFL) / 1000L)
+    
+    // Create flow ID for proper flow-based KPI computation
+    val flowId = s"${srcIp}_${dstIp}_${srcPort}_${dstPort}_${protocol}"
+    
+    PacketEvent(
+      sliceType = sliceType,
+      fileName = fileName,
+      timestamp = timestamp,
+      timestampMs = timestampMs,
+      packetLen = origLen,
+      capturedLen = capLen,
+      protocol = protocol,
+      srcIp = srcIp,
+      dstIp = dstIp,
+      srcPort = srcPort,
+      dstPort = dstPort,
+      flowId = flowId,
+      ipHeaderLen = ipHeaderLen,
+      tcpFlags = tcpFlags,
+      windowSize = windowSize,
+      seqNumber = seqNumber
+    )
   }
+}
+
+// ============================================
+// KAFKA PRODUCER MODULE
+// ============================================
+object KafkaPacketProducer extends Serializable {
   
-  // KPI Computation (36 KPIs) with proper flow partitioning and configurable thresholds
-  def computeKPIs(df: DataFrame, spark: SparkSession): DataFrame = {
+  /**
+   * Publishes packet events to Kafka in batches
+   * Each message is a single packet event (event-driven architecture)
+   */
+  def publishPacketsToKafka(packetDF: DataFrame, spark: SparkSession): Long = {
     import spark.implicits._
     
-    // Flow-partitioned window for proper IAT calculation
-    val flowWindowSpec = Window.partitionBy("sliceType", "flowId").orderBy("timestamp")
+    val kafkaBootstrap = KpiConfig.KAFKA_BOOTSTRAP_SERVERS
+    val kafkaTopic = KpiConfig.KAFKA_PACKET_TOPIC
     
-    val withIAT = df
-      .withColumn("prevTimestamp", lag("timestamp", 1).over(flowWindowSpec))
-      .withColumn("IAT", when(col("prevTimestamp").isNotNull, col("timestamp") - col("prevTimestamp")).otherwise(0.0))
-      .withColumn("windowStart", (floor(col("timestamp"))).cast(LongType))
+    println(s"\n📤 Publishing packets to Kafka...")
+    println(s"   Topic: $kafkaTopic")
+    println(s"   Bootstrap: $kafkaBootstrap")
     
-    // Use configurable thresholds
-    val idleThreshold = KpiConfig.IDLE_THRESHOLD
-    val smallPkt = KpiConfig.SMALL_PKT_THRESHOLD
-    val largePkt = KpiConfig.LARGE_PKT_THRESHOLD
-    val eps = KpiConfig.EPS
+    try {
+      // Convert PacketEvent to JSON and publish to Kafka
+      // Key = flowId for proper partitioning by flow
+      val kafkaDF = packetDF
+        .selectExpr("flowId AS key", "to_json(struct(*)) AS value")
+      
+      kafkaDF.write
+        .format("kafka")
+        .option("kafka.bootstrap.servers", kafkaBootstrap)
+        .option("topic", kafkaTopic)
+        .option("kafka.compression.type", "snappy")
+        .save()
+      
+      val count = packetDF.count()
+      println(s"   ✅ Published $count packet events to Kafka!")
+      count
+      
+    } catch {
+      case e: Exception =>
+        println(s"   ❌ Kafka publish error: ${e.getMessage}")
+        println(s"   Stack trace: ${e.printStackTrace()}")
+        0L
+    }
+  }
+}
+
+// Standalone decode function to avoid closure serialization issues
+def decodePcapFromStreamLocal(
+  pds: PortableDataStream, 
+  sliceType: String, 
+  fileName: String, 
+  maxPackets: Int
+): Iterator[PacketEvent] = PcapDecoder.decodePcapFromStream(pds, sliceType, fileName, maxPackets)
+
+// ============================================
+// MAIN APPLICATION
+// ============================================
+object PcapKpiExtractor extends Serializable {
+
+  def main(args: Array[String]): Unit = {
     
-    // Aggregate KPIs per window with proper normalization
-    val kpiDF = withIAT.groupBy("sliceType", "windowStart")
-      .agg(
-        // === VOLUME KPIs (4) ===
-        (sum("packetLen") * 8).alias("Throughput_bps"),
-        count("*").alias("Total_Packets"),
-        sum("packetLen").alias("Total_Bytes"),
-        (sum("packetLen") / (sum("IAT") + lit(eps))).alias("Byte_Velocity"),
-        
-        // === TEMPORAL KPIs (11) ===
-        avg("IAT").alias("Avg_IAT"),
-        stddev("IAT").alias("Jitter"),
-        skewness("IAT").alias("IAT_Skewness"),
-        kurtosis("IAT").alias("IAT_Kurtosis"),
-        min("IAT").alias("Min_IAT"),
-        max("IAT").alias("Max_IAT"),
-        (max("IAT") / (avg("IAT") + lit(eps))).alias("IAT_PAPR"),
-        (max("timestamp") - min("timestamp")).alias("Transmission_Duration"),
-        sum(when(col("IAT") > lit(idleThreshold), 1).otherwise(0)).alias("Idle_Periods"),
-        (sum(when(col("IAT") > lit(idleThreshold), 1).otherwise(0)) / count("*")).alias("Idle_Rate"),
-        percentile_approx(col("IAT"), lit(0.5), lit(100)).alias("IAT_Median"),
-        
-        // === PACKET SIZE KPIs (9) ===
-        avg("packetLen").alias("Avg_Packet_Size"),
-        stddev("packetLen").alias("Pkt_Size_StdDev"),
-        skewness("packetLen").alias("Pkt_Size_Skewness"),
-        kurtosis("packetLen").alias("Pkt_Size_Kurtosis"),
-        min("packetLen").alias("Min_Pkt_Size"),
-        max("packetLen").alias("Max_Pkt_Size"),
-        countDistinct("packetLen").alias("Unique_Pkt_Sizes"),
-        (sum(when(col("packetLen") < lit(smallPkt), 1).otherwise(0)) / count("*")).alias("Small_Pkt_Ratio"),
-        (sum(when(col("packetLen") > lit(largePkt), 1).otherwise(0)) / count("*")).alias("Large_Pkt_Ratio"),
-        
-        // === PROTOCOL KPIs (4) ===
-        (sum(when(col("protocol") === "TCP", 1).otherwise(0)) / count("*")).alias("TCP_Ratio"),
-        (sum(when(col("protocol") === "UDP", 1).otherwise(0)) / count("*")).alias("UDP_Ratio"),
-        countDistinct("protocol").alias("Protocol_Diversity"),
-        countDistinct("srcPort").alias("Unique_Src_Ports"),
-        
-        // === TCP HEALTH KPIs (6) - Fixed bitmask logic ===
-        avg("windowSize").alias("Avg_Win_Size"),
-        stddev("windowSize").alias("Win_Size_StdDev"),
-        min("windowSize").alias("Min_Win_Size"),
-        max("windowSize").alias("Max_Win_Size"),
-        sum(when(col("windowSize") === 0, 1).otherwise(0)).alias("Zero_Win_Count"),
-        // Fixed: Use proper bitmask comparison for RST flag (bit 2 = 0x04)
-        sum(when(col("tcpFlags").bitwiseAND(lit(0x04)) =!= 0, 1).otherwise(0)).alias("RST_Count"),
-        
-        // === FLOW KPIs (2) ===
-        countDistinct("dstPort").alias("Unique_Dst_Ports"),
-        (stddev("packetLen") / (avg("packetLen") + lit(eps))).alias("Coeff_Variation_Size")
-      )
-      .na.fill(0.0)
+    // Initialize Spark
+    val spark = SparkSession.builder()
+      .appName("5G_PCAP_Packet_Event_Extractor")
+      .config("spark.hadoop.fs.defaultFS", "hdfs://namenode:8020")
+      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+      .config("spark.kryoserializer.buffer.max", "512m")
+      .config("spark.sql.adaptive.enabled", "true")
+      .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+      .master("local[*]")
+      .getOrCreate()
     
-    kpiDF
+    import spark.implicits._
+    spark.sparkContext.setLogLevel("WARN")
+    
+    printBanner()
+    printConfiguration()
+    
+    val hdfsBasePath = KpiConfig.HDFS_RAW_PCAP
+    
+    // ========================================
+    // STEP 1: Discover PCAP Files from HDFS
+    // ========================================
+    println("\n" + "="*60)
+    println("STEP 1: Discovering PCAP Files from HDFS")
+    println("="*60)
+    
+    val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
+    val sliceDirs = Seq(
+      ("eMBB", s"$hdfsBasePath/emBB"),
+      ("URLLC", s"$hdfsBasePath/urllc"),
+      ("mMTC", s"$hdfsBasePath/mmtc")
+    )
+    
+    // Collect file paths with their slice types
+    val pcapFilesWithSlice = sliceDirs.flatMap { case (sliceType, dirPath) =>
+      try {
+        val path = new Path(dirPath)
+        if (fs.exists(path)) {
+          val files = fs.listStatus(path).filter(_.getPath.getName.endsWith(".pcap"))
+          files.map(f => (f.getPath.toString, sliceType))
+        } else {
+          println(s"   ⚠️  Directory not found: $dirPath")
+          Seq.empty
+        }
+      } catch {
+        case e: Exception =>
+          println(s"   ❌ Error accessing $dirPath: ${e.getMessage}")
+          Seq.empty
+      }
+    }
+    
+    if (pcapFilesWithSlice.isEmpty) {
+      println("\n❌ No PCAP files found! Exiting...")
+      spark.stop()
+      return
+    }
+    
+    println(s"\n📂 Found ${pcapFilesWithSlice.length} PCAP files")
+    pcapFilesWithSlice.groupBy(_._2).foreach { case (slice, files) =>
+      println(s"   $slice: ${files.length} files")
+    }
+    
+    // Create broadcast variable for slice type lookup
+    val sliceTypeMap = spark.sparkContext.broadcast(pcapFilesWithSlice.toMap)
+    val maxPackets = KpiConfig.MAX_PACKETS_PER_FILE
+    
+    // ========================================
+    // STEP 2: Distributed PCAP Decoding (Executor-Side)
+    // ========================================
+    println("\n" + "="*60)
+    println("STEP 2: Distributed PCAP Decoding (Executor-Side)")
+    println("="*60)
+    println("📦 Architecture: binaryFiles + flatMap → Executor decoding")
+    
+    val pcapPaths = pcapFilesWithSlice.map(_._1).mkString(",")
+    
+    // KEY: This runs on EXECUTORS, not Driver
+    // Use mapPartitions with explicit local function reference to avoid serialization issues
+    val packetRDD = spark.sparkContext
+      .binaryFiles(pcapPaths, minPartitions = pcapFilesWithSlice.length)
+      .mapPartitions { iter =>
+        val localSliceMap = sliceTypeMap.value
+        val localMaxPackets = maxPackets
+        iter.flatMap { case (filePath, portableDataStream) =>
+          val sliceType = localSliceMap.getOrElse(filePath, "UNKNOWN")
+          val fileName = filePath.split("/").last
+          PcapDecoder.decodePcapFromStream(portableDataStream, sliceType, fileName, localMaxPackets)
+        }
+      }
+    
+    // Convert RDD to DataFrame
+    val packetDF = packetRDD.toDF()
+    
+    val packetCount = packetDF.count()
+    println(s"\n✅ Decoded $packetCount packets (distributed)")
+    
+    if (packetCount == 0) {
+      println("\n❌ No packets decoded! Check PCAP files. Exiting...")
+      spark.stop()
+      return
+    }
+    
+    // Show schema
+    println("\n📋 Packet Event Schema:")
+    packetDF.printSchema()
+    
+    // Show distribution
+    println("\n📊 Packets by Slice Type:")
+    packetDF.groupBy("sliceType").count().orderBy(desc("count")).show()
+    
+    println("\n📊 Packets by Protocol:")
+    packetDF.groupBy("protocol").count().orderBy(desc("count")).show()
+    
+    // Show sample packets
+    println("\n📋 Sample Packet Events:")
+    packetDF.select(
+      "sliceType", "timestamp", "protocol", "packetLen", 
+      "srcIp", "dstIp", "srcPort", "dstPort", "flowId"
+    ).show(10, truncate = false)
+    
+    // ========================================
+    // STEP 3: Publish Packets to Kafka
+    // ========================================
+    println("\n" + "="*60)
+    println("STEP 3: Publishing Packet Events to Kafka")
+    println("="*60)
+    
+    val publishedCount = KafkaPacketProducer.publishPacketsToKafka(packetDF, spark)
+    
+    // ========================================
+    // STEP 4: Summary and Architecture Info
+    // ========================================
+    println("\n" + "="*60)
+    println("✅ PHASE 2 COMPLETE: PACKET-LEVEL EVENT STREAMING")
+    println("="*60)
+    
+    println("\n📊 Processing Summary:")
+    println(s"   Files Processed:      ${pcapFilesWithSlice.length}")
+    println(s"   Packets Decoded:      $packetCount")
+    println(s"   Packets Published:    $publishedCount")
+    println(s"   Kafka Topic:          ${KpiConfig.KAFKA_PACKET_TOPIC}")
+    
+    println("\n🏗️  Architecture:")
+    println("   HDFS (raw PCAP) → Spark Executors (decode) → Kafka (packet events)")
+    println("   ✓ Distributed decoding (no driver bottleneck)")
+    println("   ✓ Event-driven architecture (one message per packet)")
+    println("   ✓ Flow-based partitioning (flowId as Kafka key)")
+    
+    println("\n🚀 Next Phase:")
+    println("   Phase 3: Spark Structured Streaming → KPI Computation")
+    println("   - Read from Kafka (event-time semantics)")
+    println("   - Compute 36 KPIs per flow per window")
+    println("   - Write to HDFS (checkpointed, exactly-once)")
+    
+    // Cleanup
+    sliceTypeMap.unpersist()
+    spark.stop()
+  }
+  
+  // ========================================
+  // UTILITY FUNCTIONS
+  // ========================================
+  
+  private def printBanner(): Unit = {
+    println("\n" + "="*60)
+    println("   5G PCAP-TO-PACKET-EVENT PIPELINE")
+    println("   Phase 2: Distributed PCAP Decoding + Kafka Streaming")
+    println("="*60)
+  }
+  
+  private def printConfiguration(): Unit = {
+    println(s"\n⚙️  Configuration:")
+    println(s"   IDLE_THRESHOLD:       ${KpiConfig.IDLE_THRESHOLD}s")
+    println(s"   SMALL_PKT:            ${KpiConfig.SMALL_PKT_THRESHOLD} bytes")
+    println(s"   LARGE_PKT:            ${KpiConfig.LARGE_PKT_THRESHOLD} bytes")
+    println(s"   MAX_PACKETS/FILE:     ${KpiConfig.MAX_PACKETS_PER_FILE}")
+    println(s"   EPS:                  ${KpiConfig.EPS}")
+    println(s"   KAFKA_BOOTSTRAP:      ${KpiConfig.KAFKA_BOOTSTRAP_SERVERS}")
+    println(s"   KAFKA_PACKET_TOPIC:   ${KpiConfig.KAFKA_PACKET_TOPIC}")
+    println(s"   KAFKA_BATCH_SIZE:     ${KpiConfig.KAFKA_BATCH_SIZE}")
   }
 }
