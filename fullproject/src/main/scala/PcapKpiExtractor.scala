@@ -8,12 +8,12 @@ import java.nio.{ByteBuffer, ByteOrder}
 
 object KpiConfig {
   val MAX_PACKETS: Int = sys.env.getOrElse("KPI_MAX_PACKETS", "999999999").toInt
-  val KAFKA_BOOTSTRAP: String = sys.env.getOrElse("KAFKA_BOOTSTRAP", "bd_kafka:9092")
+  val KAFKA_BOOTSTRAP: String = sys.env.getOrElse("KAFKA_BOOTSTRAP", "kafka:9092")
   val KAFKA_TOPIC: String = sys.env.getOrElse("KAFKA_PACKET_TOPIC", "5g-packet-events")
   
-  // UPDATED: Defaulting to 172.18.0.4 to match your working configuration
-  val HDFS_NAMENODE: String = sys.env.getOrElse("HDFS_NAMENODE", "hdfs://172.18.0.4:8020")
-  val HDFS_RAW_PCAP: String = s"$HDFS_NAMENODE/5G_kpi/raw/pcap"
+  // Use DNS-resolvable hostname (renamed from bd_namenode to namenode in docker-compose)
+  val HDFS_NAMENODE: String = sys.env.getOrElse("HDFS_NAMENODE", "hdfs://namenode:8020")
+  val HDFS_RAW_PCAP: String = s"$HDFS_NAMENODE/5g_kpi/raw/pcap"
   val MIN_PARTITIONS: Int = sys.env.getOrElse("MIN_PARTITIONS", "200").toInt
 }
 

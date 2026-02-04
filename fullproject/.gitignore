@@ -1,0 +1,16 @@
+# Ignore build artifacts
+target/
+.bloop/
+.metals/
+.scala-build/
+*.class
+*.jar
+*.log
+
+# Ignore IDE settings
+.vscode/
+.idea/
+*.iml
+
+# Ignore Maven generated files
+dependency-reduced-pom.xml

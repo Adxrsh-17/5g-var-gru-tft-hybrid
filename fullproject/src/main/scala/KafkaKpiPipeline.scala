@@ -6,7 +6,7 @@ import org.apache.spark.sql.types._
 import java.sql.Timestamp
 
 object StreamingKpiConfig extends Serializable {
-  val KAFKA_BOOTSTRAP: String = sys.env.getOrElse("KAFKA_BOOTSTRAP", "bd_kafka:9092")
+  val KAFKA_BOOTSTRAP: String = sys.env.getOrElse("KAFKA_BOOTSTRAP", "kafka:9092")
   val KAFKA_TOPIC: String = sys.env.getOrElse("KAFKA_PACKET_TOPIC", "5g-packet-events")
   val HDFS_BASE: String = "/5G_kpi"
   val HDFS_OUTPUT: String = s"$HDFS_BASE/final/kpi_parquet"
@@ -129,7 +129,8 @@ object KpiComputer extends Serializable {
         approx_count_distinct("dstPort", 0.05).alias("Unique_Dst_Ports"),
         (stddev("packetLen") / (avg("packetLen") + lit(eps))).alias("Coeff_Variation_Size")
       )
-      .select(col("sliceType"), col("window.start").alias("window_start"), col("window.end").alias("window_end"), col("*"))
+      .withColumn("window_start", col("window.start"))
+      .withColumn("window_end", col("window.end"))
       .drop("window")
       .na.fill(0.0)
   }
