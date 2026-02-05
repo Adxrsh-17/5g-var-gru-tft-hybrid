@@ -4,7 +4,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.adarsh</groupId>
-    <artifactId>5g-kpi-pipeline</artifactId>
+    <artifactId>5g-kpi</artifactId>
     <version>1.0</version>
     <packaging>jar</packaging>
 
@@ -89,7 +89,7 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
-                            <finalName>5g-kpi-pipeline-assembly-1.0</finalName>
+                            <finalName>5g-kpi-assembly-1.0</finalName>
                             <filters>
                                 <filter>
                                     <artifact>*:*</artifact>
