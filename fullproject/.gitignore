@@ -14,3 +14,16 @@ target/
 
 # Ignore Maven generated files
 dependency-reduced-pom.xml
+
+# Ignore temp/generated files
+*.txt
+*.tmp
+
+# Ignore OS generated files
+.DS_Store
+Thumbs.db
+
+# Ignore data files
+*.pcap
+*.parquet
+parquet-files/
