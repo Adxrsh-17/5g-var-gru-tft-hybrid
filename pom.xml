@@ -56,6 +56,13 @@
             <artifactId>log4j</artifactId>
             <version>1.2.17</version>
         </dependency>
+
+        <!-- Microsoft ONNX Runtime for ML Inference -->
+        <dependency>
+            <groupId>com.microsoft.onnxruntime</groupId>
+            <artifactId>onnxruntime</artifactId>
+            <version>1.17.0</version>
+        </dependency>
     </dependencies>
 
     <build>
